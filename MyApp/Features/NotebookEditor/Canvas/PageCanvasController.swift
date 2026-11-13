@@ -73,6 +73,11 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
     weak var delegate: PageCanvasControllerDelegate?
 
     private(set) var page: CanvasPageModel?
+
+    /// How the next page change animates (consumed by `display`).
+    enum PageTransition { case none, revealFromTop, revealFromBottom, duplicate }
+    var pendingTransition: PageTransition = .none
+    private var transitionSnapshot: UIView?
     private(set) var elements: [PageElement] = []
     private(set) var toolKind: ToolKind = .ballpoint
     var autoShapeCorrection = true
@@ -181,6 +186,11 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
 
     func display(_ model: CanvasPageModel, content: PageContent, undoManager: UndoManager, assetURL: @escaping (String) -> URL) {
         let isNewPage = page?.pageID != model.pageID
+        let transition = isNewPage && page != nil ? pendingTransition : .none
+        pendingTransition = .none
+        // Capture the outgoing page as it looks on screen before replacing it.
+        finishTransitionImmediately()
+        let outgoing = transition == .none ? nil : canvas.snapshotView(afterScreenUpdates: false)
         page = model
         clearSelection(notify: false)
         canvas.pageUndoManager = undoManager
@@ -194,6 +204,73 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
         setNeedsLayout()
         layoutIfNeeded()
         delegate?.canvasUndoStateDidChange()
+        if let outgoing { animatePageChange(transition, outgoing: outgoing) }
+    }
+
+    // MARK: Page transitions
+
+    /// Before: the old page slides down while the new one drops in from the top.
+    /// After: the old page slides up while the new one rises from the bottom.
+    /// Duplicate: the old page shrinks back and fades while the copy settles in front.
+    private func animatePageChange(_ transition: PageTransition, outgoing: UIView) {
+        let reduceMotion = UIAccessibility.isReduceMotionEnabled
+        outgoing.frame = canvas.frame
+        outgoing.isUserInteractionEnabled = false
+        if transition == .duplicate || reduceMotion {
+            insertSubview(outgoing, belowSubview: canvas)
+        } else {
+            insertSubview(outgoing, aboveSubview: canvas)
+        }
+        transitionSnapshot = outgoing
+
+        let height = bounds.height
+        var incomingStart = CGAffineTransform.identity
+        var outgoingEnd = CGAffineTransform.identity
+        var incomingStartAlpha: CGFloat = 1
+        var outgoingEndAlpha: CGFloat = 1
+        switch (transition, reduceMotion) {
+        case (_, true):
+            incomingStartAlpha = 0
+            outgoingEndAlpha = 0
+        case (.revealFromTop, _):
+            incomingStart = CGAffineTransform(translationX: 0, y: -height)
+            outgoingEnd = CGAffineTransform(translationX: 0, y: height)
+        case (.revealFromBottom, _):
+            incomingStart = CGAffineTransform(translationX: 0, y: height)
+            outgoingEnd = CGAffineTransform(translationX: 0, y: -height)
+        case (.duplicate, _):
+            incomingStart = CGAffineTransform(translationX: 24, y: 32).scaledBy(x: 0.94, y: 0.94)
+            incomingStartAlpha = 0
+            outgoingEnd = CGAffineTransform(scaleX: 0.9, y: 0.9)
+            outgoingEndAlpha = 0
+        case (.none, _):
+            break
+        }
+
+        canvas.transform = incomingStart
+        canvas.alpha = incomingStartAlpha
+        UIView.animate(withDuration: reduceMotion ? 0.25 : 0.45, delay: 0,
+                       usingSpringWithDamping: reduceMotion ? 1 : 0.88, initialSpringVelocity: 0,
+                       options: [.allowUserInteraction, .beginFromCurrentState]) {
+            self.canvas.transform = .identity
+            self.canvas.alpha = 1
+            outgoing.transform = outgoingEnd
+            outgoing.alpha = outgoingEndAlpha
+        } completion: { _ in
+            outgoing.removeFromSuperview()
+            if self.transitionSnapshot === outgoing { self.transitionSnapshot = nil }
+        }
+    }
+
+    /// Ends a running transition at once (e.g. when pages change again mid-animation).
+    private func finishTransitionImmediately() {
+        guard let snapshot = transitionSnapshot else { return }
+        snapshot.layer.removeAllAnimations()
+        snapshot.removeFromSuperview()
+        transitionSnapshot = nil
+        canvas.layer.removeAllAnimations()
+        canvas.transform = .identity
+        canvas.alpha = 1
     }
 
     /// Updates the background (template change) without touching ink.
@@ -209,7 +286,10 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        if canvas.frame != bounds { canvas.frame = bounds }
+        // Set size/center rather than frame: frame is undefined while a page transition transforms the canvas.
+        if canvas.bounds.size != bounds.size { canvas.bounds.size = bounds.size }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        if canvas.center != center { canvas.center = center }
         if manipulationLayer.frame != bounds { manipulationLayer.frame = bounds }
         guard let page, bounds.width > 0 else { return }
         let fit = fitWidthScale(for: page.size)
@@ -741,6 +821,8 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
 
     private func beginInteraction(at point: CGPoint) {
         setScrollingLocked(true)
+        rotationSnapped = true   // no tick for the unrotated starting position
+        snapFeedback.prepare()
         Log.editor.debug("interaction begin tool=\(self.toolKind.rawValue, privacy: .public) page=(\(point.x), \(point.y)) zoom=\(self.canvas.zoomScale)")
         switch toolKind {
         case .lasso:
@@ -798,7 +880,7 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
                 .concatenating(CGAffineTransform(translationX: anchor.x, y: anchor.y))
         case .rotate:
             let center = bounds.center
-            let angle = atan2(current.y - center.y, current.x - center.x) - atan2(start.y - center.y, start.x - center.x)
+            let angle = snapRotation(atan2(current.y - center.y, current.x - center.x) - atan2(start.y - center.y, start.x - center.x))
             return CGAffineTransform(translationX: -center.x, y: -center.y)
                 .concatenating(CGAffineTransform(rotationAngle: angle))
                 .concatenating(CGAffineTransform(translationX: center.x, y: center.y))
@@ -932,10 +1014,18 @@ final class PageCanvasController: UIView, PKCanvasViewDelegate, UIPencilInteract
     }
 
     /// Snaps rotation to multiples of 15° when close.
+    /// Whether the current rotation is locked onto a right angle (for the haptic tick).
+    private var rotationSnapped = false
+    private let snapFeedback = UISelectionFeedbackGenerator()
+
+    /// Locks rotation onto 0°, 90°, 180° and 270° when within ~8°, with a haptic tick on entry.
     private func snapRotation(_ angle: CGFloat) -> CGFloat {
-        let step = CGFloat.pi / 12
-        let snapped = (angle / step).rounded() * step
-        return abs(snapped - angle) < .pi / 90 ? snapped : angle
+        let rightAngle = CGFloat.pi / 2
+        let nearest = (angle / rightAngle).rounded() * rightAngle
+        let snapped = abs(angle - nearest) < .pi / 22
+        if snapped && !rotationSnapped { snapFeedback.selectionChanged() }
+        rotationSnapped = snapped
+        return snapped ? nearest : angle
     }
 
     // MARK: UIPencilInteractionDelegate

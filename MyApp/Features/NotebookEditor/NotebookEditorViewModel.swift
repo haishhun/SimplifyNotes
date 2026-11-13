@@ -160,6 +160,7 @@ final class NotebookEditorViewModel: PageCanvasControllerDelegate {
         env.perform {
             let page = try env.repository.addPage(to: notebook, at: index, style: baseStyle)
             pages = notebook.sortedPages
+            canvas?.pendingTransition = after ? .revealFromBottom : .revealFromTop
             go(toPageID: page.id)
         }
     }
@@ -170,7 +171,10 @@ final class NotebookEditorViewModel: PageCanvasControllerDelegate {
         env.perform {
             let copies = try env.repository.duplicatePages([page])
             pages = notebook.sortedPages
-            if let copy = copies.first { go(toPageID: copy.id) }
+            if let copy = copies.first {
+                canvas?.pendingTransition = .duplicate
+                go(toPageID: copy.id)
+            }
         }
     }
 
